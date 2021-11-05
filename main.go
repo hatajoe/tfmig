@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/ktr0731/go-fuzzyfinder"
 )
@@ -21,107 +22,105 @@ func main() {
 	if tf == "" {
 		tf = "terraform"
 	}
-
-	cmd := exec.Command(tf, "version")
-	if err := cmd.Start(); err != nil {
+	if err := exec.Command(tf, "version").Run(); err != nil {
 		log.Fatal(err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		log.Fatal(err)
-	}
-
-	src := flag.String("s", "", "source location path of the terraform project")
-	dst := flag.String("d", "", "destination location path of the terrafrom project")
+	srcProj := flag.String("s", "", "source location path of the terraform project")
+	dstProj := flag.String("d", "", "destination location path of the terrafrom project")
 	workspace := flag.String("w", "", "terraform workspace name")
 
 	flag.Parse()
 
-	if *src == "" {
+	if *srcProj == "" {
 		log.Fatal("source location path (-s) is must be specified to use tfmig")
 	}
 
-	if *dst == "" {
+	if *dstProj == "" {
 		log.Fatal("destination location path (-d) is must be specified to use tfmig")
 	}
 
 	tmpDir := "/tmp/tfmig"
-	if err := os.Mkdir("/tmp/tfmig", 0755); err != nil {
-		log.Fatal(err)
+	srcBakDir := fmt.Sprintf("%s/.bak", *srcProj)
+	dstBakDir := fmt.Sprintf("%s/.bak", *dstProj)
+	for _, bak := range []string{srcBakDir, dstBakDir, tmpDir} {
+		if err := os.Mkdir(bak, 0755); err != nil {
+			log.Fatal(err)
+		}
 	}
 	defer os.RemoveAll(tmpDir)
 
 	if *workspace != "" {
-		out, err := terraform(*src, "workspace", "select", *workspace)
+		out, err := terraform(*srcProj, "workspace", "select", *workspace)
 		if err != nil {
-			errorExit(out, err)
+			log.Fatalf("%s\n%v", out, err)
 		}
 		fmt.Fprintln(os.Stdout, out)
 	}
 
-	out, err := terraform(*src, "state", "list")
-	if err != nil {
-		errorExit(out, err)
-	}
-	srcStates := strings.Split(out, "\n")
-
-	srcState, err := selectState(srcStates)
+	selectedStates, err := selectStates(*srcProj)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fromState := "/tmp/tfmig/a.tfstate"
-	out, err = terraform(*src, "state", "pull")
-	if err != nil {
-		errorExit(out, err)
-	}
-	if err := os.WriteFile(fromState, []byte(out), 0755); err != nil {
-		log.Fatal(err)
+	srcState := "/tmp/tfmig/src.tfstate"
+	dstState := "/tmp/tfmig/dst.tfstate"
+
+	day := time.Now().Format("2006-01-02-15-04-05")
+	for _, dat := range []struct {
+		Proj          string
+		StateFilename string
+		BakDirname    string
+	}{
+		{*srcProj, srcState, srcBakDir},
+		{*dstProj, dstState, dstBakDir},
+	} {
+		out, err := terraform(dat.Proj, "state", "pull")
+		if err != nil {
+			log.Fatalf("%s\n%v", out, err)
+		}
+		for _, name := range []string{
+			fmt.Sprintf("%s/%s.tfstate", dat.BakDirname, day),
+			dat.StateFilename,
+		} {
+			if err := os.WriteFile(name, []byte(out), 0755); err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 
-	toState := "/tmp/tfmig/b.tfstate"
-	out, err = terraform(*dst, "state", "pull")
-	if err != nil {
-		errorExit(out, err)
-	}
-	if err := os.WriteFile(toState, []byte(out), 0755); err != nil {
-		log.Fatal(err)
+	for _, st := range selectedStates {
+		out, err := terraform(*dstProj, "state", "mv", fmt.Sprintf("-state=%s", srcState), fmt.Sprintf("-state-out=%s", dstState), st, st)
+		if err != nil {
+			log.Fatalf("%s\n%v", out, err)
+		}
+		fmt.Fprintln(os.Stdout, out)
 	}
 
-	out, err = terraform(*dst, "state", "mv", fmt.Sprintf("-state=%s", fromState), fmt.Sprintf("-state-out=%s", toState), srcState, srcState)
-	if err != nil {
-		errorExit(out, err)
+	for _, dat := range []struct {
+		Proj            string
+		StateFilename string
+	}{
+		{*dstProj, dstState},
+		{*srcProj, srcState},
+	} {
+		out, err := terraform(dat.Proj, "state", "push", dat.StateFilename)
+		if err != nil {
+			log.Fatalf("%s\n%v", out, err)
+		}
+		fmt.Fprintln(os.Stdout, out)
 	}
-	fmt.Fprintln(os.Stdout, out)
 
-	out, err = terraform(*dst, "state", "push", toState)
-	if err != nil {
-		errorExit(out, err)
+	for _, proj := range []string{*dstProj, *srcProj} {
+		out, err := terraform(proj, "state", "list")
+		if err != nil {
+			log.Fatalf("%s\n%v", out, err)
+		}
+		fmt.Fprintln(os.Stdout, out)
 	}
-	fmt.Fprintln(os.Stdout, out)
-
-	out, err = terraform(*dst, "state", "list")
-	if err != nil {
-		errorExit(out, err)
-	}
-	fmt.Fprintln(os.Stdout, out)
-
-	out, err = terraform(*src, "state", "push", fromState)
-	if err != nil {
-		errorExit(out, err)
-	}
-	fmt.Fprintln(os.Stdout, out)
-
-	out, err = terraform(*src, "state", "list")
-	if err != nil {
-		errorExit(out, err)
-	}
-	fmt.Fprintln(os.Stdout, out)
 }
 
 func terraform(project string, args ...string) (string, error) {
-	buf := []string{}
-
 	log.Println(tf, fmt.Sprintf("-chdir=%s", project), args)
 	cmd := exec.Command(tf, append([]string{fmt.Sprintf("-chdir=%s", project)}, args...)...)
 
@@ -137,41 +136,75 @@ func terraform(project string, args ...string) (string, error) {
 	}
 	stderrScanner := bufio.NewScanner(cmdStderr)
 
+	bufch := make(chan string)
 	go func() {
 		for _, s := range []*bufio.Scanner{stdoutScanner, stderrScanner} {
 			go func(scanner *bufio.Scanner) {
 				for scanner.Scan() {
-					buf = append(buf, scanner.Text())
+					bufch <- scanner.Text()
 				}
 			}(s)
 		}
 	}()
 
-	if err := cmd.Start(); err != nil {
-		return strings.Join(buf, "\n"), err
-	}
+	donech, errch := func() (chan struct{}, chan error) {
+		donech := make(chan struct{})
+		errch := make(chan error)
+		go func() {
+			defer func() {
+				close(errch)
+				close(donech)
+				close(bufch)
+			}()
 
-	if err := cmd.Wait(); err != nil {
-		return strings.Join(buf, "\n"), err
-	}
+			if err := cmd.Start(); err != nil {
+				errch <- err
+				return
+			}
+			if err := cmd.Wait(); err != nil {
+				errch <- err
+				return
+			}
+		}()
+		return donech, errch
+	}()
 
-	return strings.Join(buf, "\n"), err
+	buf := []string{}
+	for {
+		select {
+		case b := <-bufch:
+			buf = append(buf, b)
+		case err := <-errch:
+			return strings.Join(buf, "\n"), err
+		case <-donech:
+			goto END
+		}
+	}
+END:
+
+	return strings.Join(buf, "\n"), nil
 }
 
-func errorExit(out string, err error) {
-	fmt.Fprintln(os.Stderr, out)
-	log.Fatal(err)
-}
+func selectStates(proj string) ([]string, error) {
+	out, err := terraform(proj, "state", "list")
+	if err != nil {
+		return []string{}, fmt.Errorf("%s\n%v", out, err)
+	}
+	states := strings.Split(out, "\n")
 
-func selectState(state []string) (string, error) {
-	idx, err := fuzzyfinder.Find(
-		state,
+	idx, err := fuzzyfinder.FindMulti(
+		states,
 		func(i int) string {
-			return state[i]
+			return states[i]
 		},
 	)
 	if err != nil {
-		return "", err
+		return []string{}, err
 	}
-	return state[idx], nil
+
+	ret := make([]string, 0, len(idx))
+	for _, i := range idx {
+		ret = append(ret, states[i])
+	}
+	return ret, nil
 }
