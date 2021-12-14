@@ -44,8 +44,10 @@ func main() {
 	srcBakDir := fmt.Sprintf("%s/.bak", *srcProj)
 	dstBakDir := fmt.Sprintf("%s/.bak", *dstProj)
 	for _, bak := range []string{srcBakDir, dstBakDir, tmpDir} {
-		if err := os.Mkdir(bak, 0755); err != nil {
-			log.Fatal(err)
+		if _, err := os.Stat(bak); os.IsNotExist(err) {
+			if err := os.Mkdir(bak, 0755); err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 	defer os.RemoveAll(tmpDir)
